@@ -1,16 +1,24 @@
 //SPDX-License-Identifier: Unlicense
-pragma solidity ^0.7.0;
+pragma solidity ^0.8.0;
 
 import "./NameSystem.sol";
 
 
 contract NameVickreyAuction {
     address owner;
+    uint256 ownerBalance;
     CheapNameSystem public ns;
 
     constructor(CheapNameSystem _ns) {
         owner = msg.sender;
         ns = _ns;
+    }
+
+    function withdraw() public {
+        require(msg.sender == owner);
+        require(ownerBalance > 0);
+        ownerBalance = 0;
+        payable(owner).transfer(ownerBalance);
     }
 
     function checkValid(string memory _nameStr) public pure {
@@ -19,7 +27,7 @@ contract NameVickreyAuction {
         // should not start or end with '-'
 
         bytes memory _name = bytes(_nameStr);
-        require(_name.length > 0, "Should not be empty");
+        require(_name.length >= 5, "Min length is 5");
         require(
             (_name[0] != '-') && (_name[_name.length - 1] != '-'),
             "Should not start or end with hyphen"
@@ -29,7 +37,7 @@ contract NameVickreyAuction {
             uint8 x = uint8(_name[i]);
             require(
                 (x == 45) || (x >= 48 && x <= 57) || (x >= 97 && x <= 122),
-                "Should contain only digits and lowercase letters"
+                "Should contain only digits, lowercase letters and hyphens"
             );
         }
     }
@@ -44,6 +52,7 @@ contract NameVickreyAuction {
         uint256 highBid;
         uint256 secondBid;
 
+        mapping(address => uint256) bidAndBlindOf;
         mapping(address => bytes32) hashedBidOf;
         mapping(address => bool) revealed;
     }
@@ -52,28 +61,29 @@ contract NameVickreyAuction {
     mapping(string => uint) public auctionIdForName;
     uint newAuctionId = 1;
 
-    mapping(address => uint256) public balanceOf;
-
     uint public biddingPeriod = 24 hours;
     uint public revelPeriod = 24 hours;
     uint public claimPeriod = 24 hours;
     uint public minBid = 1 ether;
 
-    function start(string memory _name) public payable {
+    event Started(string indexed _name, uint _auctionId);
+    event Bid(address indexed _by, uint256 indexed _newBidAndBlind, uint _auctionId);
+    event Reveal(address indexed _by, uint256 indexed _amount, uint _auctionId);
+
+    function start(string memory _name) public payable returns(uint) {
         require(msg.value >= minBid, "Min bid size is higher");
         checkValid(_name);
 
         uint _aid = auctionIdForName[_name];
         require(
             (_aid == 0) || auctions[_aid].claimEndsAt <= block.timestamp,
-            "Auction already exists."
+            "Already started"
         );
 
-        require(ns.checkCanRegister(_name), "Name is taken");
-
-        Auction storage a = auctions[newAuctionId];
-        auctionIdForName[_name] = newAuctionId;
+        uint auctionId = newAuctionId;
         newAuctionId += 1;
+        Auction storage a = auctions[auctionId];
+        auctionIdForName[_name] = auctionId;
 
         a.biddingEndsAt = block.timestamp + biddingPeriod;
         a.revealEndsAt = a.biddingEndsAt + revelPeriod;
@@ -81,24 +91,33 @@ contract NameVickreyAuction {
         a.highBidder = msg.sender;
         a.highBid = msg.value;
         a.secondBid = msg.value;
+        a.bidAndBlindOf[msg.sender] = msg.value;
+
+        ns.register(_name, address(this), a.claimEndsAt);
+
+        emit Started(_name, auctionId);
+        emit Bid(msg.sender, msg.value, auctionId);
+        return auctionId;
     }
 
     function bid(string memory _name, bytes32 _hash) public payable {
         require(msg.value >= minBid, "Min bid size is higher");
 
-        Auction storage a = auctions[auctionIdForName[_name]];
+        uint auctionId = auctionIdForName[_name];
+        Auction storage a = auctions[auctionId];
         require(
             block.timestamp < a.biddingEndsAt,
             "Bidding period already ended"
         );
 
+        a.bidAndBlindOf[msg.sender] += msg.value;
         a.hashedBidOf[msg.sender] = _hash;
-        balanceOf[msg.sender] += msg.value;
+        emit Bid(msg.sender, a.bidAndBlindOf[msg.sender], auctionId);
     }
 
     function claim(string memory _name) public {
         Auction storage a = auctions[auctionIdForName[_name]];
-        require(msg.sender == a.highBidder, "Only high bidded can claim");
+        require(msg.sender == a.highBidder, "Only high bidder can claim");
         require(a.claimed == false, "Already claimed");
         require(
             block.timestamp >= a.revealEndsAt,
@@ -110,9 +129,13 @@ contract NameVickreyAuction {
         );
 
         a.claimed = true;
-        balanceOf[msg.sender] += a.highBid - a.secondBid;
-        balanceOf[owner] += a.secondBid;
-        ns.register(_name, msg.sender);
+
+        uint256 bidAndBlind = a.bidAndBlindOf[a.highBidder];
+        a.bidAndBlindOf[a.highBidder] = 0;
+        payable(a.highBidder).transfer(bidAndBlind - a.secondBid);
+        ownerBalance += a.secondBid;
+        ns.renew(_name);
+        ns.transfer(_name, a.highBidder);
     }
 
     function getSaltedHash(uint256 amount, bytes32 nonce) public view returns(bytes32) {
@@ -120,7 +143,8 @@ contract NameVickreyAuction {
     }
 
     function reveal(string memory _name, uint256 amount, bytes32 nonce) public {
-        Auction storage a = auctions[auctionIdForName[_name]];
+        uint auctionId = auctionIdForName[_name];
+        Auction storage a = auctions[auctionId];
 
         require(
             block.timestamp >= a.biddingEndsAt,
@@ -136,32 +160,36 @@ contract NameVickreyAuction {
         require(!a.revealed[msg.sender]);
         a.revealed[msg.sender] = true;
 
-        if (amount > balanceOf[msg.sender]) {
+        uint256 bidAndBlind = a.bidAndBlindOf[msg.sender];
+
+        emit Reveal(msg.sender, amount, auctionId);
+
+        if (amount > bidAndBlind) {
+            // if you bid more than you sent - you lose
+            a.bidAndBlindOf[msg.sender] = 0;
+            ownerBalance += bidAndBlind;
             return;
         }
 
         if (amount > a.highBid) {
             // undo the previous escrow
-            balanceOf[a.highBidder] += a.highBid;
+            if (a.highBidder != msg.sender) {
+                // ignore auction start bid
+                uint256 highBidderBidAndBlind = a.bidAndBlindOf[a.highBidder];
+                a.bidAndBlindOf[a.highBidder] = 0;
+                payable(a.highBidder).transfer(highBidderBidAndBlind);
+            }
 
             a.secondBid = a.highBid;
             a.highBid = amount;
             a.highBidder = msg.sender;
 
-            // escrow an amount equal to the _highest_ bid
-            // not second, because if second is updated later
-            // but balance was withdrawn
-            // there will be not enough funds to claim
-            balanceOf[a.highBidder] -= a.highBid;
+            return;
         } else if (amount > a.secondBid) {
             a.secondBid = amount;
         }
-    }
 
-    function withdraw() public {
-        uint256 amount = balanceOf[msg.sender];
-        require(amount > 0, "No balance");
-        balanceOf[msg.sender] = 0;
-        msg.sender.transfer(amount);
+        a.bidAndBlindOf[msg.sender] = 0;
+        payable(msg.sender).transfer(bidAndBlind);
     }
 }

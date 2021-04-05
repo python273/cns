@@ -1,5 +1,5 @@
 //SPDX-License-Identifier: Unlicense
-pragma solidity ^0.7.0;
+pragma solidity ^0.8.0;
 
 import "hardhat/console.sol";
 
@@ -7,6 +7,7 @@ import "hardhat/console.sol";
 abstract contract NameSystem {
   function urlTemplate() public virtual view returns (string memory);
   function urlRegistrar() public virtual view returns (string memory);
+  function getOwner(string memory _name) public virtual view returns(address);
   function getRecords(string memory _name) public virtual view returns(string memory);
   function getSubNs(string memory _name) public virtual view returns(address);
 }
@@ -39,14 +40,14 @@ contract CheapNameSystem is NameSystem, HasOwners {
   uint public expiresIn = 180 days;
   uint public renewalPeriod = 30 days;
 
-  struct NameInfo {
+  struct Name {
     address owner;
     string records;
     address subNs;
     uint expiresAt;
   }
 
-  mapping(string => NameInfo) public names;
+  mapping(string => Name) public names;
 
   function urlTemplate() public override view returns(string memory) {
     return "https://%.cns.cheap/";
@@ -54,6 +55,15 @@ contract CheapNameSystem is NameSystem, HasOwners {
 
   function urlRegistrar() public override view returns(string memory) {
     return "https://cns.cheap/";
+  }
+
+  function getOwner(string memory _name) public override view returns(address) {
+    Name storage n = names[_name];
+    if (block.timestamp < n.expiresAt) {
+      return n.owner;
+    }
+
+    return address(0);
   }
 
   function getRecords(string memory _name) public override view returns(string memory) {
@@ -65,41 +75,48 @@ contract CheapNameSystem is NameSystem, HasOwners {
   }
 
   function checkCanRegister(string memory _name) public view returns(bool) {
-    NameInfo storage n = names[_name];
+    Name storage n = names[_name];
     return (n.owner == address(0)) || (block.timestamp >= n.expiresAt);
   }
 
-  function register(string memory _name, address _owner) public onlyOwner {
+  function register(string memory _name, address _owner, uint _expiresAt) public onlyOwner {
     require(checkCanRegister(_name), "Already registered");
 
-    names[_name].owner = _owner;
-    names[_name].expiresAt = block.timestamp + expiresIn;
+    if (_expiresAt == 0) {
+      _expiresAt = block.timestamp + expiresIn;
+    }
+
+    Name storage n = names[_name];
+    n.owner = _owner;
+    n.expiresAt = _expiresAt;
   }
 
-  function renew(string memory _name, address _newowner) public {
-    NameInfo storage n = names[_name];
-    require(n.owner == msg.sender, "Only owner can renew");
-    uint currentExpiresAt = names[_name].expiresAt;
-    require(block.timestamp >= currentExpiresAt, "Already expired");
+  function renew(string memory _name) public {
+    Name storage n = names[_name];
+    require(n.owner == msg.sender, "Not owner");
+
+    uint currentExpiresAt = n.expiresAt;
+
+    require(block.timestamp < currentExpiresAt, "Already expired");
     require(
-      block.timestamp > (currentExpiresAt - renewalPeriod),
-      "Can renew only X days before expiration"
+      block.timestamp >= (currentExpiresAt - renewalPeriod),
+      "Can not renew yet"
     );
 
-    names[_name].expiresAt = currentExpiresAt + expiresIn;
+    n.expiresAt = currentExpiresAt + expiresIn;
   }
 
   function transfer(string memory _name, address _newowner) public {
-    NameInfo storage n = names[_name];
-    require(n.owner == msg.sender, "Only owner can transfer");
+    Name storage n = names[_name];
+    require(n.owner == msg.sender, "Not owner");
 
-    names[_name].owner = _newowner;
+    n.owner = _newowner;
   }
 
   function updateRecords(string memory _name, string memory _records) public {
-    NameInfo storage n = names[_name];
-    require(n.owner == msg.sender, "Only owner can update records");
+    Name storage n = names[_name];
+    require(n.owner == msg.sender, "Not owner");
 
-    names[_name].records = _records;
+    n.records = _records;
   }
 }
